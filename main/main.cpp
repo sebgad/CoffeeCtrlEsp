@@ -10,16 +10,16 @@
 // PIN definitions
 
 // I2C pins
-#define SDA_0 23
-#define SCL_0 22
-#define CONV_RDY_PIN 14
+#define SDA_0 GPIO_NUM_23
+#define SCL_0 GPIO_NUM_22
+#define CONV_RDY_PIN GPIO_NUM_14
 
 // PWM defines
-#define P_SSR_PWM 21
-#define P_RED_LED_PWM 13
-#define P_GRN_LED_PWM 27
-#define P_BLU_LED_PWM 12
-#define P_STAT_LED 33 // green status LED
+#define P_SSR_PWM GPIO_NUM_21
+#define P_RED_LED_PWM GPIO_NUM_13
+#define P_GRN_LED_PWM GPIO_NUM_27
+#define P_BLU_LED_PWM GPIO_NUM_12
+#define P_STAT_LED GPIO_NUM_33 // green status LED
 #define LEDC_DUTY_RES LEDC_TIMER_13_BIT // Set duty resolution to 13 bits
 
 // File system definitions
@@ -35,17 +35,34 @@
 
 #define WDT_Timeout 15 // WatchDog Timeout in seconds
 
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_CONNECT_BIT BIT1
+
 #include <stdio.h>
 #include <sys/stat.h>
 #include <string>
 #include "esp_littlefs.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 #include "cJSON.h"
 #include "driver/ledc.h"
 #include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include <time.h>
+#include <sys/time.h>
+#include "esp_sntp.h"
+#include "mdns.h"
+
+#include "lwip/err.h"
+#include "lwip/sys.h"
+#include "webserver.cpp"
+
+static EventGroupHandle_t s_wifi_event_group;
 
 // config structure for online calibration
 struct config {
@@ -90,6 +107,16 @@ const char* strRecentLogFilePath = "/logfile_recent.txt";
 const char* strLastLogFilePath = "/logfile_last.txt";
 static char bufPrintLog[512];
 const char* strUserLogLabel = "USER";
+static int iWifiRetryNum;
+
+enum eLEDColor{
+  LED_COLOR_RED,
+  LED_COLOR_GREEN,
+  LED_COLOR_BLUE,
+  LED_COLOR_ORANGE,
+  LED_COLOR_PURPLE,
+  LED_COLOR_WHITE
+};
 
 // define configuration struct
 config objConfig;
@@ -533,7 +560,38 @@ void configLED(){
   gpio_set_level(P_STAT_LED, 1);
 }
 
-  
+
+static void event_handler(void * arg, esp_event_base_t event_base, int32_t event_id, void * event_data){
+  if (event_base == WIFI_EVENT){
+    if (event_id == WIFI_EVENT_STA_START){
+      esp_wifi_connect();
+    } else if (event_id == WIFI_EVENT_STA_DISCONNECTED){
+      if (iWifiRetryNum < 3){
+        esp_wifi_connect();
+        iWifiRetryNum++;
+        ESP_LOGI("Wifi", "retry to connect to the AP");
+      } else {
+        xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_CONNECT_BIT);
+      }
+      ESP_LOGI("Wifi", "connect to AP fail.");
+    } else if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
+        ESP_LOGI("Wifi", "station " MACSTR " join, AID=%d", MAC2STR(event->mac), event->aid);
+    } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
+        ESP_LOGI("Wifi", "station " MACSTR " leave, AID=%d", MAC2STR(event->mac), event->aid);
+    }
+  } else if (event_base == IP_EVENT ) {
+    if(event_id == IP_EVENT_STA_GOT_IP){
+      ip_event_got_ip_t * event = (ip_event_got_ip_t*) event_data;
+      ESP_LOGI("Wifi", "Device got IP address: " IPSTR, IP2STR(&event->ip_info.ip));
+      iWifiRetryNum = 0;
+      xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+  }
+}
+
+
 esp_err_t connectWiFi(const int i_total_fail = 3, const int i_timout_attemp = 1000){
   /**
    * Try to connect to WiFi Accesspoint based on the given information in the header file WiFiAccess.h.
@@ -563,69 +621,61 @@ esp_err_t connectWiFi(const int i_total_fail = 3, const int i_timout_attemp = 10
   ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, &instance_any_id));
   ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, &instance_got_ip));
 
-  wifi_config_t wifi_config = { 
-            .sta = {
-              .ssid = objConfig.wifi_ssid,
-              .password = objConfig.wifi_password,
-	            .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
-            },
-    };
+  wifi_config_t wifi_config;
+  // initialize wifi_config with zeros
+  memset(&wifi_config, 0, sizeof(wifi_config));
+  strcpy((char*)wifi_config.sta.ssid, objConfig.wifiSSID.c_str());
+  strcpy((char*)wifi_config.sta.password, objConfig.wifiPassword.c_str());
+  wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_WPA3_PSK;
     
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
-    ESP_ERROR_CHECK(esp_wifi_start());
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
+    
+  ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI("Wifi",  "Device %s try connecting to %s\n", WiFi.macAddress().c_str(), objConfig.wifiSSID.c_str());
+  /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
+  * number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above) */
+  EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_CONNECT_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
 
-    /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
-     * number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above) */
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
+  /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
+  * happened. */
+  if (bits & WIFI_CONNECTED_BIT) {
+    ESP_LOGI("Wifi",  "Connection successful");
+    b_successful = ESP_OK;
+    wifi_ap_record_t ap;
+    esp_wifi_sta_get_ap_info(&ap);
+    int i_db_m = ap.rssi;
+    int i_db_perc = 0;
 
-    /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
-     * happened. */
-    if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI("Wifi",  "Connection successful. Local IP: %s\n", WiFi.localIP().toString().c_str());
-    } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGI("Wifi",  "Connection unsuccessful. WiFi status: %d\n", i_wifi_status);
+    if (i_db_m>=-50) {
+      i_db_perc = 100;
+    } else if (i_db_m<=-100) {
+      i_db_perc = 0;
     } else {
-        ESP_LOGE("Wifi", "Unexpected event during WiFi configuration apears");
+      i_db_perc = 2*(i_db_m+100);
     }
 
-  
-  //vTaskDelay(100 / portTICK_RATE_MS);
-  s_wifi_event_group = xEventGroupCreate();
-  ESP_ERROR_CHECK(esp_netif_init());
-  ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_LOGI("Wifi", "Signal strength: %d dB -> %d %%\n", i_db_m, i_db_perc);
+  } else if (bits & WIFI_FAIL_CONNECT_BIT) {
+      ESP_ERROR_CHECK(esp_wifi_stop());
+      ESP_LOGI("Wifi",  "Connection unsuccessful. Creating Soft AP instead.");
+      wifi_config_t wifi_config;
+      memset(&wifi_config, 0, sizeof(wifi_config));
+      strcpy((char*)wifi_config.ap.ssid, "CoffeeCtrl");
+      wifi_config.ap.ssid_len = strlen("CoffeeCtrl");
+      wifi_config.ap.channel = 10;
+      strcpy((char*)wifi_config.ap.password, "");
+      wifi_config.ap.max_connection = 5;
+      //wifi_config.ap.pmf_cfg.required = false;
+      wifi_config.ap.authmode = WIFI_AUTH_OPEN;
 
-
-  int i_run_cnt_fail = 0;
-  int i_wifi_status;
-
-  WiFi.mode(WIFI_STA);
-
-  // Connect to WPA/WPA2 network:
-  WiFi.begin(objConfig.wifiSSID.c_str(), objConfig.wifiPassword.c_str());
-  i_wifi_status = WiFi.status();
-
-  while ((i_wifi_status != WL_CONNECTED) && (i_run_cnt_fail<i_total_fail)) {
-    // wait for connection establish
-    delay(i_timout_attemp);
-    i_run_cnt_fail++;
-    i_wifi_status = WiFi.status();
-    esp_log_write(ESP_LOG_INFO, strUserLogLabel,  "Connection Attemp: %d\n", i_run_cnt_fail);
-  }
-
-  if (i_wifi_status == WL_CONNECTED) {
-      // Print ESP32 Local IP Address
-      // Signal strength and approximate conversion to percentage
-      int i_dBm = WiFi.RSSI();
-      calcWifiStrength(i_dBm);
-
-      esp_log_write(ESP_LOG_INFO, strUserLogLabel,  "Signal strength: %d dB -> %d %%\n", i_dBm, iDbmPercentage);
-      b_successful = true;
+      ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+      ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+      ESP_ERROR_CHECK(esp_wifi_start());
   } else {
+      ESP_LOGE("Wifi", "Unexpected event during WiFi configuration apears");
   }
-  
+
   return b_successful;
 } // connectWiFi
 
@@ -694,6 +744,60 @@ void app_main(void)
   setColor(LED_COLOR_WHITE, true); // White
 
   // Connect to wifi and create time stamp if device is Online
-  bEspOnline = connectWiFi(3, 3000);
+  if (connectWiFi(3, 3000) == ESP_OK){
+    // Device is online, connecting to ntp server
+
+    // set time zone to western europe / berlin
+    setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+    tzset();
+
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "pool.ntp.org");
+    // accept ntp server of dhcp if available
+    sntp_servermode_dhcp(1);
+
+    sntp_init();
+
+    struct tm obj_timeinfo = {};
+    time_t obj_now = 0;
+    int i_retry_ntp = 0;
+    const int i_max_retry_ntp = 15;
+
+    char char_timestamp[64];
+
+    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++i_retry_ntp < i_max_retry_ntp) {
+      // try to connect to ntp server
+      ESP_LOGI("time", "Waiting for system time to be set... (%d/%d)", i_retry_ntp, i_max_retry_ntp);
+      vTaskDelay(2000 / portTICK_PERIOD_MS);
+    }
+
+    if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED){
+      // time is synchronized
+      time(&obj_now);
+      localtime_r(&obj_now, &obj_timeinfo);
+      
+      strftime(char_timestamp, sizeof(char_timestamp), "%c", &obj_timeinfo);
+      ESP_LOGI("time", "The current time is %s", char_timestamp);
+    } else {
+      // no time sync possible
+      ESP_LOGI("time", "Failed to obtain time stamp online");
+    }
+
+    setColor(LED_COLOR_PURPLE, false);
+
+    //initialize mDNS service
+    esp_err_t err = mdns_init();
+    if (err) {
+        printf("MDNS Init failed: %d\n", err);
+    }
+    
+    //set hostname
+    mdns_hostname_set("coffeectrl");
+    //set default instance
+    mdns_instance_name_set("Coffee Ctrl for Rancilio Silvia");
+
+    start_web_server("/littlefs");
+
+  };
 
 }
