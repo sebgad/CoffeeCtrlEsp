@@ -61,6 +61,7 @@
 #include "lwip/err.h"
 #include "lwip/sys.h"
 #include "webserver.cpp"
+#include "ADS111x.hpp"
 
 static EventGroupHandle_t s_wifi_event_group;
 
@@ -117,6 +118,9 @@ enum eLEDColor{
   LED_COLOR_PURPLE,
   LED_COLOR_WHITE
 };
+
+// Initialize ADS1115 I2C connection
+ADS1115 *objADS1115 = new ADS1115;
 
 // define configuration struct
 config objConfig;
@@ -680,6 +684,67 @@ esp_err_t connectWiFi(const int i_total_fail = 3, const int i_timout_attemp = 10
 } // connectWiFi
 
 
+esp_err_t configADS1115(){
+  /**
+   * Configure Analog digital converter ADS1115
+   */
+  
+  // Initialize I2c on defined pins with default adress
+  if (!objADS1115->begin(SDA_0, SCL_0, ADS1115_I2CADD_DEFAULT)){
+    esp_log_write(ESP_LOG_ERROR, strUserLogLabel, "Failed to initialize I2C sensor connection, stop working.\n");
+    return ESP_FAIL;
+  }
+
+  // Set Signal Filter Status
+  if(objConfig.SigFilterActive){
+    objADS1115->activateFilter();
+  }
+
+  // set Comparator Polarity to active high
+  objADS1115->setCompPolarity(ADS1115_CMP_POL_ACTIVE_HIGH);
+
+  // set differential voltage: A0-A1
+  objADS1115->setMux(ADS1115_MUX_AIN0_AIN1);
+
+  // set data rate (samples per second)
+  objADS1115->setRate(ADS1115_RATE_8);
+
+
+  #ifdef Pt1000_CONV_LINEAR
+    objADS1115->setPhysConv(fPt1000LinCoeffX1, fPt1000LinCoeffX0);
+    esp_log_write(ESP_LOG_INFO, strUserLogLabel, "Applying linear regression function for Pt1000 conversion: %.4f * Umess + %.4f\n", fPt1000LinCoeffX1, fPt1000LinCoeffX0);
+  #endif
+  #ifdef Pt1000_CONV_SQUARE
+    objADS1115->setPhysConv(fPt1000SquareCoeffX2, fPt1000SquareCoeffX1, fPt1000SquareCoeffX0);
+    esp_log_write(ESP_LOG_INFO, strUserLogLabel, "Applying square regression function for Pt1000 conversion: \
+                               %.4f * Umess^2 + %.4f * Umess + %.4f\n", fPt1000SquareCoeffX2, fPt1000SquareCoeffX1, fPt1000SquareCoeffX0)
+  #endif
+  #ifdef Pt1000_CONV_LOOK_UP_TABLE
+    const size_t size_1d_map = sizeof(arrPt1000LookUpTbl) / sizeof(arrPt1000LookUpTbl[0]);
+    objADS1115->setPhysConv(arrPt1000LookUpTbl, size_1d_map);
+    esp_log_write(ESP_LOG_INFO, strUserLogLabel, "Applying lookup table for Pt1000 conversion:\n");
+    for(int i_row=0; i_row<size_1d_map; i_row++){
+      esp_log_write(ESP_LOG_INFO, strUserLogLabel,  "%.4f    %.4f\n", arrPt1000LookUpTbl[i_row][0], arrPt1000LookUpTbl[i_row][1]);
+    }
+  #endif
+
+  // set gain amplifier
+  objADS1115->setPGA(ADS1115_PGA_0P256);
+
+  // set latching mode
+  objADS1115->setCompLatchingMode(ADS1115_CMP_LAT_ACTIVE);
+
+  // assert after one conversion
+  objADS1115->setPinRdyMode(ADS1115_CONV_READY_ACTIVE, ADS1115_CMP_QUE_ASSERT_1_CONV);
+
+  // set to continues conversion method
+  objADS1115->setOpMode(ADS1115_MODE_CONTINUOUS);
+  
+  objADS1115->printConfigReg();
+  return ESP_OK;
+}
+
+
 extern "C" {
   void app_main();
 }
@@ -743,6 +808,8 @@ void app_main(void)
   configLED();
   setColor(LED_COLOR_WHITE, true); // White
 
+  char char_timestamp[64];
+
   // Connect to wifi and create time stamp if device is Online
   if (connectWiFi(3, 3000) == ESP_OK){
     // Device is online, connecting to ntp server
@@ -762,8 +829,6 @@ void app_main(void)
     time_t obj_now = 0;
     int i_retry_ntp = 0;
     const int i_max_retry_ntp = 15;
-
-    char char_timestamp[64];
 
     while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++i_retry_ntp < i_max_retry_ntp) {
       // try to connect to ntp server
@@ -797,7 +862,28 @@ void app_main(void)
     mdns_instance_name_set("Coffee Ctrl for Rancilio Silvia");
 
     start_web_server("/littlefs");
+  }
 
-  };
+  // configure ADS1115
+  if(configADS1115() == ESP_FAIL) {
+    // TODO add diagnosis when ADS1115 is not connected
+    ESP_LOGE("ADS1115", "ADS1115 configuration not successful.\n");
+  }
 
-}
+  // Create measurement file header
+  FILE *obj_file = fopen(strMeasFilePath, "w");  
+  uint16_t i_config_reg = objADS1115->getRegisterValue(ADS1115_CONFIG_REG);
+  uint16_t i_low_reg = objADS1115->getRegisterValue(ADS1115_LOW_THRESH_REG);
+  uint16_t i_high_reg = objADS1115->getRegisterValue(ADS1115_HIGH_THRESH_REG);
+	  
+  fprintf(obj_file, "Measurement File created on %s\n", char_timestamp);
+  fprintf(obj_file, "ADS1115 register settings\n");
+  fprintf(obj_file, "ADS1115 register settings\n");
+  fprintf(obj_file, "Config register: %d\n", i_config_reg);
+  fprintf(obj_file, "Low threshold register: %d\n", i_low_reg);
+  fprintf(obj_file, "High threshold register: %d\n\n", i_high_reg);
+  fprintf(obj_file, "Time,Temperature,TargetPWM,Buffer,InterruptCountAlertReady\n");
+
+  fflush(obj_file);
+  fclose(obj_file);
+};

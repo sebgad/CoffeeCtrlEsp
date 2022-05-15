@@ -40,17 +40,17 @@ static esp_err_t index_html_get_handler(httpd_req_t *req)
 }
 
 /* Handler to respond with an icon file embedded in flash.
- * Browsers expect to GET website icon at URI /favicon.ico.
+ * Browsers expect to GET website icon at URI /favicon.png.
  * This can be overridden by uploading file with same name */
-// static esp_err_t favicon_get_handler(httpd_req_t *req)
-// {
-//     extern const unsigned char favicon_ico_start[] asm("_binary_favicon_ico_start");
-//     extern const unsigned char favicon_ico_end[]   asm("_binary_favicon_ico_end");
-//     const size_t favicon_ico_size = (favicon_ico_end - favicon_ico_start);
-//     httpd_resp_set_type(req, "image/x-icon");
-//     httpd_resp_send(req, (const char *)favicon_ico_start, favicon_ico_size);
-//     return ESP_OK;
-// }
+static esp_err_t favicon_get_handler(httpd_req_t *req)
+{
+    extern const unsigned char favicon_png_start[] asm("_binary_favicon_png_start");
+    extern const unsigned char favicon_png_end[]   asm("_binary_favicon_png_end");
+    const size_t favicon_png_size = (favicon_png_end - favicon_png_start);
+    httpd_resp_set_type(req, "image/x-icon");
+    httpd_resp_send(req, (const char *)favicon_png_start, favicon_png_size);
+    return ESP_OK;
+}
 
 /* Send HTTP response with a run-time generated html consisting of
  * a list of all files and folders under the requested path.
@@ -216,9 +216,9 @@ static esp_err_t download_get_handler(httpd_req_t *req)
          * corresponds to one of the hardcoded paths */
         if (strcmp(filename, "/index.html") == 0) {
             return index_html_get_handler(req);
-        }// else if (strcmp(filename, "/favicon.ico") == 0) {
-        //    return favicon_get_handler(req);
-        //}
+        } else if (strcmp(filename, "/favicon.ico") == 0) {
+            return favicon_get_handler(req);
+        }
         ESP_LOGE(TAG, "Failed to stat file : %s", filepath);
         /* Respond with 404 Not Found */
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File does not exist");
